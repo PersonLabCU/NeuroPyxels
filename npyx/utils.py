@@ -30,11 +30,68 @@ import scipy.signal as sgnl
 # Initialize NeuroPyxel's global joblib cache
 # with its size to the available memory minus 5GB
 from npyx.CONFIG import __cachedir__
+import functools, inspect as _inspect
 from cachecache import Cacher, distributed_cacher
+
 global_npyx_cacher = Cacher(__cachedir__)
-# arguments of decorated functions altering caching behavior:
-# again, cache_results, cache_path
-npyx_cacher = distributed_cacher('dp', '.NeuroPyxels', global_npyx_cacher)
+
+# Use distributed caching: results are stored at '{dp}/.NeuroPyxels' so that
+# cache lives alongside the recording data.  joblib 1.5+ no longer uses %XX
+# URL-encoded characters in its internal directory names, so Isilon/SMB drives
+# handle the paths fine.  The global_npyx_cacher serves as the fallback when
+# no 'dp' argument is present.
+_base_npyx_cacher = distributed_cacher('dp', '.NeuroPyxels', global_npyx_cacher)
+
+
+def npyx_cacher(func):
+    """
+    Thin wrapper around global_npyx_cacher that automatically recovers from
+    stale joblib cache entries (KeyError: 'Non-existing item').
+
+    Caches results at the LOCAL ~/.NeuroPyxels directory (see __cachedir__ in
+    npyx/CONFIG.py) to avoid network-filesystem issues with joblib's %XX-encoded
+    directory names.  Different recording paths are kept separate because 'dp'
+    is always included in the joblib argument hash.
+    """
+    cached = _base_npyx_cacher(func)
+    sig = _inspect.signature(func)
+    params = sig.parameters
+    param_names = list(params.keys())
+
+    def _build_retry_kwargs(args, kwargs):
+        positionally_bound = set(param_names[:len(args)])
+        retry_kwargs = dict(kwargs)
+        if 'cache_results' in params and 'cache_results' not in positionally_bound:
+            retry_kwargs['cache_results'] = False
+        if 'again' in params and 'again' not in positionally_bound:
+            retry_kwargs['again'] = True
+        return retry_kwargs
+
+    @functools.wraps(func)
+    def _wrapper(*args, **kwargs):
+        try:
+            return cached(*args, **kwargs)
+        except PermissionError:
+            # Parallel workers can race on the same cache file (Windows file
+            # locking).  Fall back to computing without touching the cache.
+            retry_kwargs = _build_retry_kwargs(args, kwargs)
+            return func(*args, **retry_kwargs)
+        except FileNotFoundError as exc:
+            # joblib can race while updating cache metadata (func_code.py)
+            # in parallel workers, especially on network filesystems.
+            if 'func_code.py' not in str(exc):
+                raise
+            retry_kwargs = _build_retry_kwargs(args, kwargs)
+            return func(*args, **retry_kwargs)
+        except KeyError as exc:
+            if 'Non-existing item' not in str(exc):
+                raise
+            # Build retry kwargs: force bypass of cache lookup.
+            # Only add keyword overrides for params not already covered positionally.
+            retry_kwargs = _build_retry_kwargs(args, kwargs)
+            return cached(*args, **retry_kwargs)
+
+    return _wrapper
 
 
 #%% function decoration utilities

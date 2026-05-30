@@ -1,0 +1,182 @@
+NeuroPyxels - c4_class environment
+CuPy + CUDA installation command log (Windows)
+Date: 2026-05-02
+
+Context
+- Existing conda env used: c4_class
+- GPU/driver CUDA reported by nvidia-smi: 12.8
+- Goal: install CuPy and cudatoolkit, then verify GPU execution
+
+1) Verify environment and GPU baseline
+
+conda info --envs
+conda run -n c4_class python -c "import sys; print(sys.version)"
+nvidia-smi
+
+2) Check current package state in c4_class
+
+conda list -n c4_class | Select-String -Pattern "cupy|cuda|cudnn|numpy"
+conda run -n c4_class python -c "import importlib.util as u, importlib.metadata as m; print('numpy', m.version('numpy')); print('cupy_spec', bool(u.find_spec('cupy')))"
+
+3) Attempt conda install of cupy + cudatoolkit
+
+conda install -n c4_class -c conda-forge -y cupy cudatoolkit
+
+4) Separate cudatoolkit install attempt (resolved to CUDA 11.8 on channels)
+
+conda install -n c4_class -c conda-forge -y cudatoolkit
+
+5) Install CUDA 12 CuPy wheel (working base)
+
+conda run -n c4_class python -m pip install -U cupy-cuda12x
+
+6) First CuPy GPU smoke test (failed due to CUDA toolkit conflict)
+
+conda run -n c4_class python -c "import cupy as cp; print('cupy', cp.__version__); print('runtime', cp.cuda.runtime.runtimeGetVersion()); print('driver', cp.cuda.runtime.driverGetVersion()); print('devices', cp.cuda.runtime.getDeviceCount()); x=cp.arange(10, dtype=cp.float32); print('sum', float(x.sum().get()))"
+
+Observed issue:
+- cudatoolkit 11.8.0 in env conflicted with cupy-cuda12x runtime expectations.
+
+7) Confirm/remove conflicting cudatoolkit
+
+conda list -n c4_class | Select-String -Pattern "cudatoolkit|cuda"
+conda remove -n c4_class -y cudatoolkit
+
+8) Install missing CUDA runtime/NVRTC DLL packages for CuPy on Windows
+
+conda run -n c4_class python -m pip install -U nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
+
+9) Final CuPy GPU validation (successful)
+
+conda run -n c4_class python -c "import cupy as cp; print('cupy', cp.__version__); print('runtime', cp.cuda.runtime.runtimeGetVersion()); print('driver', cp.cuda.runtime.driverGetVersion()); print('devices', cp.cuda.runtime.getDeviceCount()); x=cp.arange(10, dtype=cp.float32); print('sum', float(x.sum().get()))"
+
+Expected successful output indicators:
+- cupy 14.0.1
+- runtime 12090
+- driver 12080
+- devices 1
+- sum 45.0
+
+10) Final package versions recorded
+
+conda run -n c4_class python -m pip show cupy-cuda12x nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12
+
+10) Install additional CUDA library DLLs required by CuPy (cublasLt etc. missing)
+
+D:\anaconda3\envs\c4_class\Scripts\pip.exe install nvidia-cublas-cu12 nvidia-nvjitlink-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12
+
+11) Set CUDA_PATH environment variable so CuPy detects the toolkit
+
+    The CUDA toolkit (12.8) is installed at:
+    C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+
+    Set it permanently for the c4_class conda env activation:
+
+conda env config vars set CUDA_PATH="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" -n c4_class
+
+    Verify:
+conda run -n c4_class python -c "import os; print('CUDA_PATH:', os.environ.get('CUDA_PATH', 'NOT_SET'))"
+
+    Expected output: CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+
+12) Install PyTorch (CUDA 12.8 build) for Python 3.13
+
+    Use the c4_class env's pip.exe directly to avoid PowerShell execution policy issues:
+
+D:\anaconda3\envs\c4_class\Scripts\pip.exe install "torch>=2.7" torchvision --index-url https://download.pytorch.org/whl/cu128
+
+    This installs torch-2.11.0+cu128 and torchvision-0.26.0+cu128 (cp313 wheels).
+
+    NOTE: Do NOT use `conda run -n c4_class pip install` for large packages — conda run
+    buffers/suppresses pip output on Windows with PowerShell, making it appear to hang.
+    Call the env's pip.exe directly instead.
+
+13) Install laplace-torch and dill (other c4 dependencies)
+
+D:\anaconda3\envs\c4_class\Scripts\pip.exe install laplace-torch dill
+
+    This installs laplace-torch 0.2.2.2 and its dependencies (curvlinops 3.0.1, etc.)
+
+14) Patch laplace-torch for compatibility with curvlinops 3.x
+
+    curvlinops 3.x renamed curvlinops._base -> curvlinops._torch_base.
+    Patch line 15 of:
+    D:\anaconda3\envs\c4_class\Lib\site-packages\laplace\curvature\curvlinops.py
+
+    Replace:
+        from curvlinops._base import _LinearOperator
+
+    With:
+        try:
+            from curvlinops._base import _LinearOperator
+        except ImportError:
+            from curvlinops._torch_base import PyTorchLinearOperator as _LinearOperator
+
+    Use the following Python one-liner (from the fix_laplace.py temp script approach):
+
+$script = @'
+import re
+path = r'D:\anaconda3\envs\c4_class\Lib\site-packages\laplace\curvature\curvlinops.py'
+with open(path, 'r', encoding='utf-8') as f:
+    content = f.read()
+content = content.replace(
+    'from curvlinops._base import _LinearOperator',
+    'try:\n    from curvlinops._base import _LinearOperator\nexcept ImportError:\n    from curvlinops._torch_base import PyTorchLinearOperator as _LinearOperator'
+)
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+print('done')
+'@
+$script | Out-File -FilePath "$env:TEMP\fix_laplace.py" -Encoding utf8
+D:\anaconda3\envs\c4_class\python.exe "$env:TEMP\fix_laplace.py"
+
+15) Patch laplace-torch baselaplace.py to make asdfghjkl import optional
+
+    The installed asdl/asdfghjkl 0.1a4 package has an incompatible API with what
+    laplace 0.2.2.2 expects (hessian_eigenvalues renamed, etc.). The AsdfghjklHessian
+    backend is not needed for c4 inference — make it an optional import.
+
+    Edit:
+    D:\anaconda3\envs\c4_class\Lib\site-packages\laplace\baselaplace.py
+
+    Replace line 18:
+        from laplace.curvature.asdfghjkl import AsdfghjklHessian
+
+    With:
+        try:
+            from laplace.curvature.asdfghjkl import AsdfghjklHessian
+        except (ImportError, ModuleNotFoundError):
+            AsdfghjklHessian = None
+
+16) Final verification
+
+conda run -n c4_class python -c "import torch; import laplace; import dill; print('torch:', torch.__version__); print('CUDA:', torch.cuda.is_available())"
+
+    Expected output:
+        torch: 2.11.0+cu128
+        CUDA: True
+
+conda run -n c4_class python -c "from npyx.c4.predict_cell_types import run_c4; print('c4 import OK')"
+
+    Expected output:
+        npyx[c4] version 4.2.0 imported.
+        c4 import OK
+
+    Run c4 (remember to quote paths that contain spaces):
+
+c4 -dp "S:\path\to\recording\with spaces\continuous\Neuropix-PXI-108.ProbeA-AP"
+
+Notes
+- Although requested, conda cudatoolkit available on current channels resolved to 11.8.0, which was not compatible with the CUDA 12 CuPy path in this environment.
+- The working configuration uses:
+  - cupy-cuda12x
+  - nvidia-cuda-runtime-cu12
+  - nvidia-cuda-nvrtc-cu12
+  - nvidia-cublas-cu12 + nvidia-nvjitlink-cu12 + nvidia-cusolver-cu12 + nvidia-cusparse-cu12
+  - torch-2.11.0+cu128 (cp313) + torchvision-0.26.0+cu128
+  - laplace-torch 0.2.2.2 (with curvlinops.py and baselaplace.py patches)
+  - dill 0.4.1
+- Commands above are listed exactly as executed during setup/troubleshooting.
+- CUDA_PATH must be set in the conda env for CuPy to find the toolkit at runtime.
+- On Windows, use the env's pip.exe directly for large downloads to avoid conda run output buffering.
+- Paths with spaces must be quoted when passed to the c4 CLI.

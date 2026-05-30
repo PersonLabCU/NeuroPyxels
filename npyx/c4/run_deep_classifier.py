@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import os
 
@@ -15,7 +17,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-with contextlib.suppress(ImportError):
+TORCH_AVAILABLE = False
+try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -25,6 +28,24 @@ with contextlib.suppress(ImportError):
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     from torchvision import transforms
+    TORCH_AVAILABLE = True
+except ImportError:
+    # Keep module importable without torch; advanced entry points enforce deps.
+    torch = None
+    nn = None
+    F = None
+    optim = None
+    transforms = None
+    DEVICE = "cpu"
+
+    class _TorchDataShim:
+        class Dataset:
+            pass
+
+        class DataLoader:
+            pass
+
+    data = _TorchDataShim()
 
 try:
     from laplace import BaseLaplace, Laplace
@@ -65,7 +86,7 @@ from .dl_utils import (
     load_waveform_encoder,
     load_waveform_vae,
 )
-from .misc import require_advanced_deps
+from .misc import MissingTorch, require_advanced_deps
 
 SEED = 42
 
@@ -172,66 +193,74 @@ class CustomCompose:
         return format_string
 
 
-class CustomDataset(data.Dataset):
-    """Dataset of waveforms and 3D acgs. Every batch will have shape:
-    (batch_size, WAVEFORM_SAMPLES * ACG_3D_BINS * ACG_3D_LEN))"""
+if not TORCH_AVAILABLE:
 
-    def __init__(
-        self,
-        data,
-        targets,
-        spikes_list=None,
-        spikes_transform=None,
-        wave_transform=None,
-        layer=None,
-        multi_chan_wave=False,
-    ):
-        """
-        Args:
-            data (ndarray): Array of data points, with wvf and acg concatenated
-            targets (string): Array of labels for the provided data
-            raw_spikes (ndarray): Array of raw spikes for the provided data, used in acg augmentations.
-        """
-        self.data = data
-        self.targets = targets
-        if spikes_list is not None:
-            self.spikes_list = np.array(spikes_list, dtype=object)
-        else:
-            self.spikes_list = None
-        self.spikes_transform = spikes_transform
-        self.wave_transform = wave_transform
-        self.layer = layer
-        if self.layer is not None:
-            assert len(layer) == len(data), f"Layer and data must have same length, got {len(layer)} and {len(data)}"
-        self.multi_chan_wave = multi_chan_wave
+    class CustomDataset(MissingTorch):
+        def __init__(self):
+            super().__init__()
 
-    def __len__(self):
-        return len(self.data)
+else:
 
-    def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-        data_point = self.data[idx, :].astype("float32")
-        target = self.targets[idx].astype("int")
-        if self.layer is not None:
-            layer = self.layer[idx, :].astype("float32")
-        if self.spikes_list is not None:
-            spikes = self.spikes_list[idx].astype("int")
+    class CustomDataset(data.Dataset):
+        """Dataset of waveforms and 3D acgs. Every batch will have shape:
+        (batch_size, WAVEFORM_SAMPLES * ACG_3D_BINS * ACG_3D_LEN))"""
 
-        if self.spikes_transform is not None:
-            acg = data_point[:2010]
-            acg = self.spikes_transform(spikes, acg)
-        else:
-            acg = data_point[:2010].reshape(10, 201)[:, 100:].ravel()
+        def __init__(
+            self,
+            data,
+            targets,
+            spikes_list=None,
+            spikes_transform=None,
+            wave_transform=None,
+            layer=None,
+            multi_chan_wave=False,
+        ):
+            """
+            Args:
+                data (ndarray): Array of data points, with wvf and acg concatenated
+                targets (string): Array of labels for the provided data
+                raw_spikes (ndarray): Array of raw spikes for the provided data, used in acg augmentations.
+            """
+            self.data = data
+            self.targets = targets
+            if spikes_list is not None:
+                self.spikes_list = np.array(spikes_list, dtype=object)
+            else:
+                self.spikes_list = None
+            self.spikes_transform = spikes_transform
+            self.wave_transform = wave_transform
+            self.layer = layer
+            if self.layer is not None:
+                assert len(layer) == len(data), f"Layer and data must have same length, got {len(layer)} and {len(data)}"
+            self.multi_chan_wave = multi_chan_wave
 
-        waveform = data_point[2010:]
-        if self.wave_transform is not None:
-            waveform = self.wave_transform(waveform).squeeze()
-        if self.layer is not None:
-            data_point = np.concatenate((acg.ravel(), waveform, layer)).astype("float32")
-        else:
-            data_point = np.concatenate((acg.ravel(), waveform)).astype("float32")
-        return data_point, target
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, idx):
+            if torch.is_tensor(idx):
+                idx = idx.tolist()
+            data_point = self.data[idx, :].astype("float32")
+            target = self.targets[idx].astype("int")
+            if self.layer is not None:
+                layer = self.layer[idx, :].astype("float32")
+            if self.spikes_list is not None:
+                spikes = self.spikes_list[idx].astype("int")
+
+            if self.spikes_transform is not None:
+                acg = data_point[:2010]
+                acg = self.spikes_transform(spikes, acg)
+            else:
+                acg = data_point[:2010].reshape(10, 201)[:, 100:].ravel()
+
+            waveform = data_point[2010:]
+            if self.wave_transform is not None:
+                waveform = self.wave_transform(waveform).squeeze()
+            if self.layer is not None:
+                data_point = np.concatenate((acg.ravel(), waveform, layer)).astype("float32")
+            else:
+                data_point = np.concatenate((acg.ravel(), waveform)).astype("float32")
+            return data_point, target
 
 
 def plot_training_curves(train_losses, f1_train, epochs, save_folder=None):
@@ -392,7 +421,7 @@ def get_kronecker_hessian_attributes(*kronecker_hessians: KronDecomposed):
 def predict_unlabelled(
     model: Union[BaseLaplace, torch.nn.Module],
     test_loader: data.DataLoader,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = DEVICE,
     enforce_layer: bool = False,
     labelling: Optional[dict] = None,
 ) -> torch.Tensor:
@@ -417,9 +446,17 @@ def predict_unlabelled(
     probabilities = []
     with torch.no_grad():
         for x, _ in test_loader:
-            model_probabilities = model(x.float().to(device))
-            if not isinstance(model, BaseLaplace):
-                model_probabilities = torch.softmax(model_probabilities, dim=-1)
+            if isinstance(model, BaseLaplace):
+                try:
+                    model_probabilities = model(x.float().to(device))
+                except AttributeError as exc:
+                    if "Laplace not fitted" not in str(exc):
+                        raise
+                    base_model = model.model
+                    base_model.eval()
+                    model_probabilities = torch.softmax(base_model(x.float().to(device)), dim=-1)
+            else:
+                model_probabilities = torch.softmax(model(x.float().to(device)), dim=-1)
             if enforce_layer:
                 model_probabilities = layer_correction(model_probabilities, x[:, -4:], labelling)
             probabilities.append(model_probabilities)
@@ -432,7 +469,7 @@ def get_model_probabilities(
     model: torch.nn.Module,
     train_loader: data.DataLoader,
     test_loader: data.DataLoader,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = DEVICE,
     laplace: bool = True,
     enforce_layer: bool = False,
     labelling: Optional[dict] = None,
@@ -692,8 +729,21 @@ def load_calibrated_ensemble(models, hessians):
             torch.nn.utils.parameters_to_vector(calibrated_model.model.last_layer.parameters()).detach(),
         )
         setattr(calibrated_model, "H", hessian)
-        calibrated_model.optimize_prior_precision(method="marglik")
-        calibrated_models.append(calibrated_model)
+        # Some laplace versions require fit() before optimizing the prior precision,
+        # even when a precomputed Hessian is provided. Keep defaults in that case.
+        try:
+            calibrated_model.optimize_prior_precision(method="marglik")
+        except AttributeError as exc:
+            if "Laplace not fitted" not in str(exc):
+                raise
+        # Guard against Laplace versions that do not treat preloaded Hessians as fitted.
+        try:
+            calibrated_model._check_H_init()
+            calibrated_models.append(calibrated_model)
+        except AttributeError as exc:
+            if "Laplace not fitted" not in str(exc):
+                raise
+            calibrated_models.append(model)
 
     return calibrated_models
 
@@ -702,7 +752,7 @@ def load_calibrated_ensemble(models, hessians):
 def ensemble_predict(
     ensemble,
     test_iterator,
-    device=torch.device("cpu"),
+    device=DEVICE,
     method="average",
     enforce_layer=False,
     labelling=None,
@@ -710,6 +760,10 @@ def ensemble_predict(
     predicted_probabilities = []
 
     for model in tqdm(ensemble, leave=True, position=0, desc="Predicting with ensemble"):
+        if isinstance(model, BaseLaplace):
+            model.model = model.model.to(device)
+        else:
+            model = model.to(device)
         if not isinstance(model, BaseLaplace):
             model.eval()
         probabilities = predict_unlabelled(
@@ -1086,7 +1140,7 @@ def ensemble_inference(
 
     ensemble = load_ensemble(
         ensemble_path,
-        device=torch.device("cpu"),
+        device=DEVICE,
         pool_type=args.pool_type,
         n_classes=n_classes,
         use_layer=args.use_layer,
@@ -1099,7 +1153,7 @@ def ensemble_inference(
     raw_probabilities = ensemble_predict(
         ensemble,
         test_iterator,
-        device=torch.device("cpu"),
+        device=DEVICE,
         method="raw",
         enforce_layer=enforce_layer,
         labelling=labelling,

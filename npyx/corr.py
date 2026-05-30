@@ -43,14 +43,23 @@ from npyx.merger import get_source_dp_u, assert_same_dataset, assert_multi
 import scipy.signal as sgnl
 from npyx.stats import pdf_normal, pdf_poisson, cdf_poisson, fractile_normal
 
-def make_phy_like_spikeClustersTimes(dp, U, periods='all', verbose=False, trains=None, enforced_rp=0):
+def make_phy_like_spikeClustersTimes(dp, U, periods='all', verbose=False,
+                                     trains=None, enforced_rp=0,
+                                     again=False, cache_results=True, cache_path=None):
     '''
     - trains: list of spike trains, in samples.'''
     trains_dic={}
     if trains is None:
         for iu, u in enumerate(U):
             # Even lists of strings can be dealt with as integers by being replaced by their indices
-            trains_dic[iu]=trn(dp, u, sav=True, periods=periods, verbose=verbose, enforced_rp=enforced_rp) # trains in samples
+            trains_dic[iu]=trn(dp, u,
+                               sav=True,
+                               periods=periods,
+                               verbose=verbose,
+                               enforced_rp=enforced_rp,
+                               again=again,
+                               cache_results=cache_results,
+                               cache_path=cache_path) # trains in samples
     else:
         #assert len(trains)>1
         assert type(trains) in [list, np.ndarray]
@@ -100,7 +109,15 @@ def crosscorrelate_cyrille(dp, bin_size, win_size, U, fs=30000, symmetrize=True,
     #### Get clusters and times
     U=list(U)
 
-    spike_times, spike_clusters = make_phy_like_spikeClustersTimes(dp, U, periods=periods, verbose=verbose, trains=trains, enforced_rp=enforced_rp)
+    spike_times, spike_clusters = make_phy_like_spikeClustersTimes(
+        dp, U,
+        periods=periods,
+        verbose=verbose,
+        trains=trains,
+        enforced_rp=enforced_rp,
+        again=again,
+        cache_results=cache_results,
+        cache_path=cache_path)
 
     return crosscorr_cyrille(spike_times, spike_clusters, win_size, bin_size, fs, symmetrize, log_window_end, n_log_bins)
 
@@ -265,7 +282,8 @@ def get_log_bins_samples(log_window_end, n_log_bins, fs):
 
 def ccg(dp, U, bin_size, win_size, fs=30000, normalize='Hertz',
        ret=True, sav=True, verbose=False, periods='all', again=False,
-       trains=None, enforced_rp=0, log_window_end=None, n_log_bins=10):
+    trains=None, enforced_rp=0, log_window_end=None, n_log_bins=10,
+    cache_results=True, cache_path=None):
     '''
     ********
     computes crosscorrelogram (1, window/bin_size) - int64, in Hertz
@@ -350,7 +368,9 @@ def ccg(dp, U, bin_size, win_size, fs=30000, normalize='Hertz',
         if verbose: print("File {} not found in routines memory.".format(fn))
         crosscorrelograms = crosscorrelate_cyrille(dp, bin_size, win_size, sortedU, fs, True,
                                                 periods, verbose, trains, enforced_rp,
-                                                log_window_end, n_log_bins, again)
+                                                log_window_end, n_log_bins, again,
+                                                cache_results=cache_results,
+                                                cache_path=cache_path)
         crosscorrelograms = np.asarray(crosscorrelograms, dtype='float64')
         if crosscorrelograms.shape[0]<len(U): # no spikes were found in this period
             # Maybe if not any(crosscorrelograms.ravel()!=0):
@@ -358,12 +378,24 @@ def ccg(dp, U, bin_size, win_size, fs=30000, normalize='Hertz',
         if normalize in ['Hertz', 'Pearson', 'zscore']:
             for i1,u1 in enumerate(sortedU):
                 if trains is None:
-                    Nspikes1=len(trn(dp, u1, verbose=False, periods=periods, enforced_rp=enforced_rp))
+                    Nspikes1=len(trn(dp, u1,
+                                     verbose=False,
+                                     periods=periods,
+                                     enforced_rp=enforced_rp,
+                                     again=again,
+                                     cache_results=cache_results,
+                                     cache_path=cache_path))
                 else:
                     Nspikes1=len(trains[i1]) # trains and sortedU are both sorted
                 for i2,u2 in enumerate(sortedU):
                     if trains is None:
-                        Nspikes2 = len(trn(dp, u2, verbose=False, periods=periods, enforced_rp=enforced_rp))
+                        Nspikes2 = len(trn(dp, u2,
+                                           verbose=False,
+                                           periods=periods,
+                                           enforced_rp=enforced_rp,
+                                           again=again,
+                                           cache_results=cache_results,
+                                           cache_path=cache_path))
                     else:
                         Nspikes2=len(trains[i2]) # trains and sortedU are both sorted
                     arr=crosscorrelograms[i1,i2,:]
@@ -585,7 +617,8 @@ def ccg_2d(t1, t2, binsize, windowsize,
 
 def acg(dp, u, bin_size, win_size, fs=30000, normalize='Hertz',
         ret=True, sav=True, verbose=False, periods='all', again=False,
-        train=None, enforced_rp=0, log_window_end=None, n_log_bins=10):
+    train=None, enforced_rp=0, log_window_end=None, n_log_bins=10,
+    cache_results=True, cache_path=None):
     '''
     ********
     computes autocorrelogram (1, window/bin_size) - int64, in Hertz
@@ -615,7 +648,8 @@ def acg(dp, u, bin_size, win_size, fs=30000, normalize='Hertz',
     # NEVER save as acg..., uses the function ccg() which pulls out the acg from files stored as ccg[...].
     if train is not None: train = [train]
     return ccg(dp, [u,u], bin_size, win_size, fs, normalize, ret, sav, verbose,
-               periods, again, train, enforced_rp, log_window_end, n_log_bins)[0,0,:]
+               periods, again, train, enforced_rp, log_window_end, n_log_bins,
+               cache_results=cache_results, cache_path=cache_path)[0,0,:]
 
 def scaled_acg(dp, units, cut_at = 150, bs = 0.5, fs=30000, normalize='Hertz',
             min_sec = 180, again = False, period_m = [0,20],

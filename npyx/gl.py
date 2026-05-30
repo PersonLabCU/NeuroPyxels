@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from npyx.utils import npa, is_writable
+from npyx.inout import resolve_phy_path
 
 
 def get_npyx_memory(dp):
@@ -375,10 +376,10 @@ def load_units_qualities(dp, again=False):
         - qualities: panda dataframe, dataset units qualities
     """
     f = "cluster_group.tsv"
-    dp = Path(dp)
+    dp = resolve_phy_path(Path(dp))
     try:
         if (dp / f).exists():
-            qualities = pd.read_csv(dp / f, sep='\s+')
+            qualities = pd.read_csv(dp / f, sep=r'\s+')
             re_spikesorted = detect_new_spikesorting(dp)
             regenerate = True if (again or re_spikesorted) else False
             assert (
@@ -457,6 +458,7 @@ def load_merged_units_qualities(dp_merged, ds_table=None):
 def get_units(dp, quality="all", chan_range=None, again=False):
     assert quality in ["all", "good", "mua", "noise", "unsorted"]
 
+    dp = Path(dp)
     if assert_multi(dp):
         qualities = load_merged_units_qualities(dp)
         try:
@@ -470,6 +472,7 @@ def get_units(dp, quality="all", chan_range=None, again=False):
         )
         save_qualities(dp, qualities)
     else:
+        dp = resolve_phy_path(dp)
         qualities = load_units_qualities(dp, again=again)
 
     if quality == "all":

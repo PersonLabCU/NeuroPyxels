@@ -54,11 +54,12 @@ def ids(dp, unit, sav=True, verbose=False, periods='all',
     '''
 
     dp = Path(dp)
+    dp_source = npyx.merger.get_source_dp_u(dp, unit)[0]
     err_mess = f'WARNING unit {unit} not found in dataset {dp}!'
     try:
-        assert unit in get_units(dp), err_mess
+        assert unit in get_units(dp_source), err_mess
     except AssertionError:
-        assert unit in get_units(dp, again=True), err_mess
+        assert unit in get_units(dp_source, again=True), err_mess
 
     # DEPRECATED now caching with cachecache
     # # Search if the variable is already saved in dp/routinesMemory
@@ -85,7 +86,7 @@ def ids(dp, unit, sav=True, verbose=False, periods='all',
     #         indices = np.nonzero(spike_clusters==unt)[0].ravel()
     # else:
 
-    spike_clusters = np.load(dp/"spike_clusters.npy", mmap_mode='r')
+    spike_clusters = np.load(dp_source/"spike_clusters.npy", mmap_mode='r')
     indices = np.nonzero(spike_clusters==unit)[0].ravel()
 
     # DEPRECATED now caching with cachecache
@@ -94,7 +95,6 @@ def ids(dp, unit, sav=True, verbose=False, periods='all',
     #     np.save(dpnm/fn, indices)
 
     # Optional selection of spikes without duplicates
-    dp_source = npyx.merger.get_source_dp_u(dp, unit)[0]
     fs = read_metadata(dp_source)["highpass"]['sampling_rate']
     train = trn(dp, unit, again=again, enforced_rp=-1, cache_results=cache_results)
     duplicates_m = duplicates_mask(train, enforced_rp, fs)
@@ -123,7 +123,8 @@ def load_amplitudes(dp, unit, verbose=False,
     dp = Path(dp)
     unit_ids = ids(dp, unit, True, verbose, periods, again, enforced_rp,
                    cache_results=cache_results, cache_path=cache_path)
-    return np.load(dp/'amplitudes.npy')[unit_ids]
+    # amplitudes.npy can be (N, 1) depending on sorter/export; flatten for downstream scalar math.
+    return np.ravel(np.load(dp/'amplitudes.npy')[unit_ids])
 
 @npyx_cacher
 def trn(dp, unit, sav=True, verbose=False,
@@ -153,6 +154,7 @@ def trn(dp, unit, sav=True, verbose=False,
     # DEPRECATED now caching with cachecache
     # Search if the variable is already saved in dp/routinesMemory
     # dpnm = get_npyx_memory(dp)
+    dp = Path(dp)
     dp_source = npyx.merger.get_source_dp_u(dp, unit)[0]
     fs=read_metadata(dp_source)['highpass']['sampling_rate']
 
@@ -169,14 +171,14 @@ def trn(dp, unit, sav=True, verbose=False,
         # DEPRECATED now caching with cachecache
         #if verbose: print(f"File {fn} not found in routines memory. Will be computed from source files.")
         if not (assert_int(unit)|assert_float(unit)): raise TypeError(f'WARNING unit {unit} type ({type(unit)}) not handled!')
-        err_mess = f'WARNING unit {unit} not found in dataset {dp}!'
+        err_mess = f'WARNING unit {unit} not found in dataset {dp_source}!'
         try:
-            assert unit in get_units(dp), err_mess
+            assert unit in get_units(dp_source), err_mess
         except AssertionError:
-            assert unit in get_units(dp, again=True), err_mess
+            assert unit in get_units(dp_source, again=True), err_mess
 
-        spike_clusters = np.load(Path(dp,"spike_clusters.npy"), mmap_mode='r')
-        spike_samples = np.load(Path(dp,'spike_times.npy'), mmap_mode='r')
+        spike_clusters = np.load(Path(dp_source,"spike_clusters.npy"), mmap_mode='r')
+        spike_samples = np.load(Path(dp_source,'spike_times.npy'), mmap_mode='r')
         train = spike_samples[spike_clusters==unit].ravel()
 
         # Filter out spike duplicates (spikes following an ISI shorter than enforced_rp)
@@ -576,7 +578,8 @@ def train_quality(dp, unit, period_m=[0,20],
                   use_or_operator = True,
                   violations_ms = 0.8, fp_threshold = 0.05, fn_threshold = 0.05,
                   again = False, save = True, verbose = False, plot_debug = False,
-                  enforced_rp = 0, saveFig=False, saveDir=None, _format='png'):
+                  enforced_rp = 0, saveFig=False, saveDir=None, _format='png',
+                  cache_results=True, cache_path=None):
     """
     Subselect spike times which meet two criteria:
         low number of 'missed spikes' (false negatives)
@@ -669,10 +672,11 @@ def train_quality(dp, unit, period_m=[0,20],
     
     # Load data
     unit_amp = load_amplitudes(dp, unit, verbose, 'all', again, enforced_rp,
-                               cache_results=save)
+                               cache_results=cache_results, cache_path=cache_path)
     
     unit_train = trn(dp, unit, enforced_rp=enforced_rp,
-                     again=again, verbose=verbose, cache_results=save)/fs
+                     again=again, verbose=verbose,
+                     cache_results=cache_results, cache_path=cache_path)/fs
 
     if period_m is None:
         period_m = [0, unit_train[-1]//60]
@@ -859,7 +863,8 @@ def trn_filtered(dp, unit, period_m=[0,20],
                   violations_ms = 0.8, fp_threshold = 0.05, fn_threshold=0.05,
                   use_consecutive = False, consecutive_n_seconds = 180,
                   again = False, save = True, verbose = False, plot_debug = False,
-                  enforced_rp=0, saveFig=False, saveDir=None, _format='pdf'):
+                  enforced_rp=0, saveFig=False, saveDir=None, _format='pdf',
+                  cache_results=True, cache_path=None):
     """
     Returns spike times (in sample) meeting the false positive and false negative criteria.
     Mainly wrapper of train_quality().
@@ -881,12 +886,14 @@ def trn_filtered(dp, unit, period_m=[0,20],
     {0}
     """
     dp = Path(dp)
-    t = trn(dp,unit, enforced_rp=enforced_rp, again=again, cache_results=save)
+    t = trn(dp,unit, enforced_rp=enforced_rp, again=again,
+            cache_results=cache_results, cache_path=cache_path)
     t_s=t/30000
     good_spikes_m, good_fp_start_end, good_fn_start_end = train_quality(dp, unit, period_m,
                     fp_chunk_span, fp_chunk_size, fn_chunk_span, fn_chunk_size, use_or_operator,
                     violations_ms, fp_threshold, fn_threshold, again, save, verbose, plot_debug,
-                    enforced_rp, saveFig, saveDir, _format)
+                    enforced_rp, saveFig, saveDir, _format,
+                    cache_results=cache_results, cache_path=cache_path)
 
     # use spike times themselves to define beginning and end of good Sections
     # as the FP and FN sections do not necessarily overlap

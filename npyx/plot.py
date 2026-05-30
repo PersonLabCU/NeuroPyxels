@@ -836,7 +836,7 @@ def plt_wvf(waveforms, subcm=None, waveforms_std=None,
             else:
                 ax[i].axis('off')
         if not labels:
-            xlimdiff=np.diff(ax[i_bottomleft].get_xlim())
+            xlimdiff=np.diff(ax[i_bottomleft].get_xlim()).item()
             ylimdiff=ylim2-ylim1
             y_scale=int(ylimdiff*0.3-(ylimdiff*0.3)%10)
             ax[i_bottomleft].plot([0,1],[ylim1,ylim1], c='k', lw=scalebar_w)
@@ -898,7 +898,8 @@ def plot_raw(dp, times=None, alignement_events=None, window=None, channels=np.ar
              plot_ylabels=True, show_allyticks=0, yticks_jump=None, plot_baselines=False,
              events=[], set0atEvent=1, align_events_as_sweeps=False,
              ax=None, ext_data=None, ext_datachans=np.arange(384),
-             as_heatmap=False, vmin=-50, vmax=50, center=0, legend=None):
+             as_heatmap=False, vmin=-50, vmax=50, center=0, legend=None,
+             cache_results=True, cache_path=None):
     '''
     Plot raw data over a specified window of time, over a specified range of channels.
 
@@ -967,7 +968,8 @@ def plot_raw(dp, times=None, alignement_events=None, window=None, channels=np.ar
             rc = extract_rawChunk(dp, times, channels, filt_key, 1,
                      whiten, med_sub, hpfilt, hpfiltf, filter_forward, filter_backward,
                      nRangeWhiten, nRangeMedSub, use_ks_w_matrix,
-                     ignore_ks_chanfilt, center_chans_on_0, 0, 1, again)
+                     ignore_ks_chanfilt, center_chans_on_0, 0, 1, again,
+                     cache_results=cache_results, cache_path=cache_path)
 
         if alignement_events is not None:
             assert window is not None
@@ -978,7 +980,8 @@ def plot_raw(dp, times=None, alignement_events=None, window=None, channels=np.ar
             rc=extract_rawChunk(dp, alignement_events[0]+npa(window)/1e3, channels, filt_key, 1,
                      whiten, med_sub, hpfilt, hpfiltf, filter_forward, filter_backward,
                      nRangeWhiten, nRangeMedSub, use_ks_w_matrix,
-                     ignore_ks_chanfilt, center_chans_on_0, 0, 1, again)
+                     ignore_ks_chanfilt, center_chans_on_0, 0, 1, again,
+                     cache_results=cache_results, cache_path=cache_path)
             for e in alignement_events[1:]:
                 times=e+npa(window)/1e3
                 if align_events_as_sweeps:
@@ -986,12 +989,14 @@ def plot_raw(dp, times=None, alignement_events=None, window=None, channels=np.ar
                                                               whiten, med_sub, hpfilt, hpfiltf, filter_forward,
                                                               filter_backward, nRangeWhiten, nRangeMedSub,
                                                               use_ks_w_matrix, ignore_ks_chanfilt,
-                                                              center_chans_on_0, 0, 1, again)))
+                                                              center_chans_on_0, 0, 1, again,
+                                                              cache_results=cache_results, cache_path=cache_path)))
                 else:
                     rc += extract_rawChunk(dp, times, channels, filt_key, 1,
                                          whiten, med_sub, hpfilt, hpfiltf, filter_forward, filter_backward,
                                          nRangeWhiten, nRangeMedSub, use_ks_w_matrix,
-                                         ignore_ks_chanfilt, center_chans_on_0, 0, 1, again)
+                                         ignore_ks_chanfilt, center_chans_on_0, 0, 1, again,
+                                         cache_results=cache_results, cache_path=cache_path)
             rc = rc/len(alignement_events) if not align_events_as_sweeps else rc
     else:
         channels=assert_chan_in_dataset(dp, ext_datachans, ignore_ks_chanfilt)
@@ -1098,7 +1103,7 @@ def plot_raw_units(dp, times, units=[], channels=np.arange(384), offset=450,
                    Nchan_plot=5, spk_window=82, colors='phy', bg_color='k', lw=1, bg_alpha=0.8, lw_color=1.1,
                    title=None, saveDir='~/Downloads', saveData=0, saveFig=0, _format='pdf', figsize=(20,8),
                    whiten=False, nRangeWhiten=None, med_sub=False, nRangeMedSub=None, hpfilt=0, hpfiltf=300,
-                   filter_forward=False, filter_backward=False,ignore_ks_chanfilt=0,
+                   filter_forward=True, filter_backward=True,ignore_ks_chanfilt=0,
                    show_allyticks=0, yticks_jump=None, plot_ylabels=True, events=[], set0atEvent=1,
                    again=False, ax=None, enforced_peakChan=None):
     f'''
@@ -1123,6 +1128,8 @@ def plot_raw_units(dp, times, units=[], channels=np.arange(384), offset=450,
     #     peakChan=get_peak_chan(dp,units[0])
     #     channels=np.arange(peakChan-Nchan_plot//2-1, peakChan+Nchan_plot//2+2)
     channels=assert_chan_in_dataset(dp, channels, ignore_ks_chanfilt)
+    if hpfilt and not (filter_forward or filter_backward):
+        filter_forward = True
 
     rc = extract_rawChunk(dp, times, channels, 'highpass', saveData,
                      whiten, med_sub, hpfilt, hpfiltf, filter_forward, filter_backward,
@@ -2357,6 +2364,7 @@ def plot_acg(dp, unit, cbin=0.2, cwin=80, normalize='Hertz', periods='all',
              color=0, labels=True, title=None, ref_per=True, ylim=[0, 0], ax=None,
              acg_mn=None, acg_std=None, again=False,
              train=None, hide_axis=False, prettify=True, enforced_rp=0, fs=30_000,
+             cache_results=True, cache_path=None,
              **mplp_kwargs):
     """
     Plots precomputed autocorrelogram.
@@ -2399,13 +2407,22 @@ def plot_acg(dp, unit, cbin=0.2, cwin=80, normalize='Hertz', periods='all',
     if train is not None:
         bChs = None
     else:
-        bChs = get_depthSort_peakChans(dp, units=[unit])[:, 1].flatten()
+        bChs = get_depthSort_peakChans(
+            dp,
+            units=[unit],
+            again=again,
+            cache_results=cache_results,
+            cache_path=cache_path,
+        )[:, 1].flatten()
     ylim1, ylim2 = ylim[0], ylim[1]
 
     ACG = acg(dp, unit, cbin, cwin, fs=fs, normalize=normalize,
-              verbose=verbose, periods=periods, again=again, train=train, enforced_rp=enforced_rp)
+              verbose=verbose, periods=periods, again=again, train=train, enforced_rp=enforced_rp,
+              cache_results=cache_results, cache_path=cache_path)
     if normalize == 'zscore':
-        ACG_hertz = acg(dp, unit, cbin, cwin, fs=fs, normalize='Hertz', verbose=verbose, periods=periods)
+        ACG_hertz = acg(dp, unit, cbin, cwin, fs=fs, normalize='Hertz', verbose=verbose,
+                        periods=periods, again=again, train=train, enforced_rp=enforced_rp,
+                        cache_results=cache_results, cache_path=cache_path)
         acg25, acg35 = ACG_hertz[:int(len(ACG_hertz) * 2. / 5)], ACG_hertz[int(len(ACG_hertz) * 3. / 5):]
         acg_std = np.std(np.append(acg25, acg35))
         acg_mn = np.mean(np.append(acg25, acg35))
@@ -2423,7 +2440,7 @@ def plot_ccg(dp, units, cbin=0.2, cwin=80, normalize='mixte',
              ylim_acg=None, ylim_ccg=None, share_y=False,
              ccg_means=None, ccg_deviations=None, again=False, trains=None, as_grid=False, show_hz=False,
              use_template=True, enforced_rp=0, style='line', hide_axis=False, pad=0,
-             prettify=True, fs=30_000,
+             prettify=True, fs=30_000, cache_results=True, cache_path=None,
              **mplp_kwargs):
     """
     Arguments:
@@ -2480,18 +2497,28 @@ def plot_ccg(dp, units, cbin=0.2, cwin=80, normalize='mixte',
 
     if trains is None:
         # order of channels is swapped - fix it
-        bChs = get_depthSort_peakChans(dp, units=units, use_template=use_template)[:,1].flatten()
+        bChs = get_depthSort_peakChans(
+            dp,
+            units=units,
+            use_template=use_template,
+            again=again,
+            cache_results=cache_results,
+            cache_path=cache_path,
+        )[:,1].flatten()
     else:
         bChs = None
 
     if CCG is None:
         normalize1 = normalize if normalize!='mixte' else 'Hertz'
-        CCG = ccg(dp, units, cbin, cwin, fs=fs, normalize=normalize1, verbose=0, periods=periods, again=again, trains=trains, enforced_rp=enforced_rp)
+        CCG = ccg(dp, units, cbin, cwin, fs=fs, normalize=normalize1, verbose=0, periods=periods,
+              again=again, trains=trains, enforced_rp=enforced_rp,
+              cache_results=cache_results, cache_path=cache_path)
     assert CCG is not None
 
     if normalize in ['mixte', 'zscore']:
         CCG_hertz=ccg(dp, units, cbin, cwin, fs=fs, normalize='Hertz', verbose=0,
-                        periods=periods, again=again, trains=trains)
+                        periods=periods, again=again, trains=trains,
+                        cache_results=cache_results, cache_path=cache_path)
         nbins = CCG_hertz.shape[2]
         ccg25, ccg35 = CCG_hertz[:,:,:int(nbins*2./5)], CCG_hertz[:,:,int(nbins*3./5):]
         ccg_baseline = np.concatenate((ccg25, ccg35), axis=2)

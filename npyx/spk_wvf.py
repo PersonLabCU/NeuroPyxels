@@ -742,7 +742,9 @@ def get_peak_chan(dp, unit, use_template=True, again=False,
         if op.exists(Path(dp, f)):
             peak_chans=np.load(Path(dp, f))
             if unit in peak_chans[:,0]:
-                return int(peak_chans[peak_chans[:,0]==unit, 1])
+                matched_peak_chans = np.ravel(peak_chans[peak_chans[:,0]==unit, 1])
+                if matched_peak_chans.size:
+                    return int(matched_peak_chans[0])
 
     cm=chan_map(dp, probe_version='local')
     if use_template:
@@ -821,8 +823,12 @@ def get_depthSort_peakChans(dp, units=[], quality='all',
     for iu, u in enumerate(units):
         if verbose: print("Getting peak channel of unit {}...".format(u))
         peak_chans[iu,0] = u
-        peak_chans[iu,1] = np.array([get_peak_chan(dp, u, use_template,
-                                       cache_results=cache_results, cache_path=cache_path)]).astype(dt)
+        peak_chan_u = np.ravel(np.asarray(
+            get_peak_chan(dp, u, use_template,
+                          cache_results=cache_results, cache_path=cache_path)
+        ))
+        assert peak_chan_u.size, f"No peak channel found for unit {u}."
+        peak_chans[iu,1] = peak_chan_u[0]
     if assert_multi(dp):
         depth_ids = np.lexsort((-peak_chans[:,1], get_ds_ids(peak_chans[:,0])))
     else:
@@ -940,10 +946,15 @@ def select_waveforms_in_batch(spike_ids, n_waveforms, batch_size_waveforms):
     else:
         n_excerpts=n_waveforms // batch_size_waveforms
         excerpt_size=batch_size_waveforms
-        ids_subset = np.concatenate([data_chunk(spike_ids, chunk)
-                    for chunk in excerpts(len(spike_ids),
-                                        n_excerpts=n_excerpts,
-                                        excerpt_size=excerpt_size)])
+        if n_excerpts < 2:
+            # fall back to simple stride selection when batch math yields < 2 excerpts
+            step = ceil(np.clip(1. / n_waveforms * len(spike_ids), 1, len(spike_ids)))
+            ids_subset = spike_ids[0::step][:n_waveforms]
+        else:
+            ids_subset = np.concatenate([data_chunk(spike_ids, chunk)
+                        for chunk in excerpts(len(spike_ids),
+                                            n_excerpts=n_excerpts,
+                                            excerpt_size=excerpt_size)])
         
     return ids_subset
 

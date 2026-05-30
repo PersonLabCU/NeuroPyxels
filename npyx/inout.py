@@ -9,6 +9,7 @@ Input/output utilitaries to deal with Neuropixels files.
 
 import os
 import shutil
+import sys
 from ast import literal_eval as ale
 from math import ceil
 from pathlib import Path
@@ -30,6 +31,121 @@ import json
 from npyx.utils import list_files, npa, read_pyfile, npyx_cacher, is_writable
 
 #%% Load metadata and channel map
+
+_EMITTED_WARNING_KEYS = set()
+
+def _emit_warning(message, color_code=None):
+    """Best-effort warning emitter that stays safe inside Windows workers."""
+    text = str(message)
+    if color_code and sys.stdout is not None and getattr(sys.stdout, "isatty", lambda: False)():
+        text = f"\033[{color_code}m{text}\033[0m"
+    try:
+        print(text)
+    except OSError:
+        try:
+            stream = sys.__stderr__ if sys.__stderr__ is not None else sys.stderr
+            if stream is not None:
+                stream.write(text + "\n")
+                stream.flush()
+        except OSError:
+            pass
+
+
+def _emit_warning_once(message, warning_key=None, color_code=None):
+    """Emit a warning only once per Python process."""
+    key = warning_key if warning_key is not None else str(message)
+    if key in _EMITTED_WARNING_KEYS:
+        return
+    _EMITTED_WARNING_KEYS.add(key)
+    _emit_warning(message, color_code=color_code)
+
+def _resolve_oe_recording_root(dp: Path) -> Path:
+    """Return recording root for OpenEphys (expects events/continuous siblings)."""
+    dp = Path(dp)
+    candidates = [dp]
+    candidates.extend(dp.parents)
+    for cand in candidates:
+        if (cand / 'events').exists() and (cand / 'continuous').exists():
+            return cand
+    for cand in candidates:
+        if (cand / 'events').exists():
+            return cand
+    return dp
+
+
+def _resolve_oe_stream_dir(dp: Path, stream_folder: str) -> Path:
+    """Return OpenEphys stream directory that contains continuous.dat."""
+    dp = Path(dp)
+    candidates = [dp]
+    if dp.name == 'continuous':
+        candidates.append(dp / stream_folder)
+    for cand in [dp, *dp.parents]:
+        candidates.append(cand / 'continuous' / stream_folder)
+
+    checked = []
+    for cand in candidates:
+        if cand in checked:
+            continue
+        checked.append(cand)
+        if cand.exists() and cand.is_dir() and any(list_files(cand, "dat", False)):
+            return cand
+
+    for cand in checked:
+        if cand.exists() and cand.is_dir():
+            return cand
+    return dp
+
+
+def resolve_phy_path(dp: Path) -> Path:
+    """Resolve a user datapath to a Phy/Kilosort folder containing params.py.
+
+    Supports users passing either:
+    - stream folder (.../continuous/<stream>)
+    - continuous folder (.../continuous)
+    - recording root (.../recording1)
+    """
+    dp = Path(dp)
+    if (dp / "params.py").exists():
+        return dp
+
+    candidates = []
+
+    if (dp / "continuous").exists() and (dp / "continuous").is_dir():
+        candidates.extend([p for p in (dp / "continuous").iterdir() if p.is_dir()])
+    if dp.name == "continuous" and dp.is_dir():
+        candidates.extend([p for p in dp.iterdir() if p.is_dir()])
+
+    # Also support nearby parent variants.
+    parent_candidates = [dp]
+    parent_candidates.extend(list(dp.parents)[:2])
+    for cand in parent_candidates:
+        cont = cand / "continuous"
+        if cont.exists() and cont.is_dir():
+            candidates.extend([p for p in cont.iterdir() if p.is_dir()])
+
+    seen = set()
+    stream_dirs = []
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if (cand / "params.py").exists() and (cand / "spike_clusters.npy").exists():
+            stream_dirs.append(cand)
+
+    if not stream_dirs:
+        return dp
+
+    # Prefer AP stream folders.
+    def _score(path_obj: Path):
+        name = path_obj.name.upper()
+        if "AP" in name:
+            return 0
+        if name.endswith(".0"):
+            return 1
+        return 2
+
+    stream_dirs.sort(key=lambda p: (_score(p), str(p)))
+    return stream_dirs[0]
 
 def read_metadata(dp):
     f'''
@@ -90,6 +206,7 @@ def metadata(dp):
     dp = Path(dp)
     assert dp.exists(), "Provided path does not exist!"
     assert dp.is_dir(), f"Provided path {dp} is a filename!"
+    oe_recording_root = _resolve_oe_recording_root(dp)
 
     probe_versions = { # see https://billkarsh.github.io/SpikeGLX/help/imroTables/
         'glx':{3.0:  '3A', # option 3
@@ -141,6 +258,12 @@ def metadata(dp):
     glx_ap_files = list_files(dp, "ap.meta", True)
     glx_lf_files = list_files(dp, "lf.meta", True)
     oe_files = list_files(dp, "oebin", True)
+    if not any(oe_files) and oe_recording_root != dp:
+        oe_files = list_files(oe_recording_root, "oebin", True)
+    if not any(oe_files):
+        oe_files = [str(p) for p in dp.rglob('*.oebin')]
+    if not any(oe_files) and oe_recording_root != dp:
+        oe_files = [str(p) for p in oe_recording_root.rglob('*.oebin')]
     glx_found = np.any(glx_ap_files) or np.any(glx_lf_files)
     oe_found = np.any(oe_files)
     assert glx_found or oe_found, \
@@ -176,11 +299,18 @@ def metadata(dp):
         meta['bit_uV_conv_factor']=meta_oe["continuous"][probe_index]["channels"][0]["bit_volts"]
 
         # index for highpass and lowpass
+        # New OE format (>=2021): folder_name contains 'AP' or 'LFP'
+        # Old OE format (<2021): folder_name is 'Neuropix-PXI-100.0/' (.0=AP, .1=LFP)
         filt_index = {'highpass': [], 'lowpass': []}
-        for i,processor in enumerate(meta_oe['continuous']):
-            if 'AP' in processor['folder_name']:
+        for i, processor in enumerate(meta_oe['continuous']):
+            fname = processor['folder_name']
+            if 'AP' in fname:
                 filt_index['highpass'] = i
-            if 'LFP' in processor['folder_name']:
+            elif 'LFP' in fname:
+                filt_index['lowpass'] = i
+            elif fname.rstrip('/').endswith('.0'):
+                filt_index['highpass'] = i
+            elif fname.rstrip('/').endswith('.1'):
                 filt_index['lowpass'] = i
 
 
@@ -188,6 +318,10 @@ def metadata(dp):
         for filt_key in ['highpass','lowpass']:
             meta[filt_key]={}
             filt_key_i=filt_index[filt_key]
+            if isinstance(filt_key_i, list):
+                # stream not found in this recording (e.g. no LFP stream)
+                meta[filt_key]['binary_relative_path']='not_found'
+                continue
             meta[filt_key]['sampling_rate']=float(meta_oe["continuous"][filt_key_i]['sample_rate'])
             meta[filt_key]['n_channels_binaryfile']=int(meta_oe["continuous"][filt_key_i]['num_channels'])
             if params_f.exists():
@@ -196,19 +330,30 @@ def metadata(dp):
             else:
                 meta[filt_key]['n_channels_analysed']=meta[filt_key]['n_channels_binaryfile']
                 meta[filt_key]['datatype']='int16'
-            binary_folder = './continuous/'+meta_oe["continuous"][filt_key_i]['folder_name']
-            binary_file = list_files(dp/binary_folder, "dat", False)
+
+            # Accept dp as recording root, ./continuous, or ./continuous/<stream_name>.
+            stream_folder = meta_oe["continuous"][filt_key_i]['folder_name']
+            binary_rel_dir = Path('continuous') / stream_folder
+            binary_folder = './' + str(binary_rel_dir).replace('\\', '/')
+            stream_dir = _resolve_oe_stream_dir(dp, stream_folder)
+            binary_file = list_files(stream_dir, "dat", False)
             if any(binary_file):
-                binary_rel_path = binary_folder+binary_file[0]
+                binary_rel_path = binary_folder + '/' + binary_file[0]
                 meta[filt_key]['binary_relative_path']=binary_rel_path
-                meta[filt_key]['binary_byte_size']=os.path.getsize(dp/binary_rel_path)
+                meta[filt_key]['binary_byte_size']=os.path.getsize(stream_dir / binary_file[0])
                 if filt_key=='highpass' and params_f.exists() and params['dat_path']!=binary_rel_path:
-                    print((f'\033[34;1mWARNING edit dat_path in params.py '
-                    f'so that it matches relative location of high pass filtered binary file: {binary_rel_path}'))
+                    _emit_warning_once(
+                        f'WARNING edit dat_path in params.py so that it matches relative location of high pass filtered binary file: {binary_rel_path}',
+                        warning_key='oe_dat_path_mismatch',
+                        color_code='34;1',
+                    )
             else:
                 meta[filt_key]['binary_relative_path']='not_found'
                 meta[filt_key]['binary_byte_size']='unknown'
-                print(f"\033[91;1mWARNING {filt_key} binary file not found at {dp}\033[0m")
+                _emit_warning(
+                    f"WARNING {filt_key} binary file not found at {stream_dir}",
+                    color_code='91;1',
+                )
             meta[filt_key]={**meta[filt_key], **meta_oe["continuous"][filt_key_i]}
         meta["events"]=meta_oe["events"]
         meta["spikes"]=meta_oe["spikes"]
@@ -359,6 +504,11 @@ def chan_map(dp=None, y_orig='surface', probe_version=None):
         dp = Path(dp)
         c_ind = np.load(dp / 'channel_map.npy')
         cp    = np.load(dp / 'channel_positions.npy')
+        # c_ind may be stored as (1, N) or (N,) — reshape to (N, 1) for concatenation
+        if c_ind.ndim == 1:
+            c_ind = c_ind.reshape(-1, 1)
+        elif c_ind.ndim == 2 and c_ind.shape[0] == 1:
+            c_ind = c_ind.T
         cm    = np.concatenate([c_ind, cp], axis=1).astype(int)
 
     if y_orig == 'surface':
@@ -426,14 +576,21 @@ def get_binary_file_path(dp, filt_suffix='ap', absolute_path=True):
     {get_glx_file_path.__doc__}
     '''
 
-    if 'continuous' in os.listdir(dp):
-        meta = read_metadata(dp)
-        if 'ap' in filt_suffix:
-            return f'{dp}/continuous/{meta["highpass"]["folder_name"][:-1]}/continuous.dat'
-        if 'lf' in filt_suffix:
-            return f'{dp}/continuous/{meta["lowpass"]["folder_name"][:-1]}/continuous.dat'
-    else:
-        return get_glx_file_path(dp, 'bin', filt_suffix, absolute_path)
+    dp = Path(dp)
+    meta = read_metadata(dp)
+
+    if meta.get('acquisition_software') == 'OpenEphys':
+        filt_key = 'highpass' if 'ap' in filt_suffix else 'lowpass'
+        rel_path = meta[filt_key].get('binary_relative_path', 'not_found')
+        assert rel_path != 'not_found', f"OpenEphys binary file not found for {filt_key} at {dp}."
+
+        # binary_relative_path is relative to recording root.
+        binary_root = _resolve_oe_recording_root(dp)
+
+        binary_path = binary_root / rel_path
+        return str(binary_path) if absolute_path else rel_path
+
+    return get_glx_file_path(dp, 'bin', filt_suffix, absolute_path)
     
 def get_meta_file_path(dp, filt_suffix='ap', absolute_path=True):
     f'''Return the path of the meta file (.meta) from a directory.
@@ -521,12 +678,30 @@ def get_npix_sync(dp, output_binary = False, filt_key='highpass', unit='seconds'
     # proceed
     if meta['acquisition_software'] == 'OpenEphys':
 
-        events_dirs = [p for p in (dp/'events').iterdir() if 'PXI' in str(p)]
-        high_pass_dir = [p for p in events_dirs if ("AP" in str(p))|("100.0" in str(p))][0]
-        low_pass_dir = [p for p in events_dirs if ("LF" in str(p))|("100.1" in str(p))][0]
+        oe_root = _resolve_oe_recording_root(dp)
+
+        events_path = oe_root / 'events'
+        assert events_path.exists(), (
+            f"OpenEphys events directory not found at {events_path}. "
+            "Pass the recording root path or a valid subpath under it."
+        )
+
+        events_dirs = [p for p in events_path.iterdir() if 'PXI' in str(p)]
+        high_pass_candidates = [p for p in events_dirs if ("AP" in str(p))|("100.0" in str(p))]
+        low_pass_candidates = [p for p in events_dirs if ("LF" in str(p))|("100.1" in str(p))]
+
+        assert any(high_pass_candidates), f"No OpenEphys AP/PXI events stream found in {events_path}."
+        high_pass_dir = high_pass_candidates[0]
+        low_pass_dir = low_pass_candidates[0] if any(low_pass_candidates) else None
 
 
-        events_dir = high_pass_dir if filt_key=='highpass' else low_pass_dir
+        if filt_key == 'lowpass':
+            assert low_pass_dir is not None, (
+                f"No OpenEphys LF/PXI lowpass events stream found in {events_path}."
+            )
+            events_dir = low_pass_dir
+        else:
+            events_dir = high_pass_dir
         for i, ttl_dir in enumerate(events_dir.iterdir()):
             timestamps = np.load(ttl_dir / "timestamps.npy")
             ttl_i = ttl_dir.name

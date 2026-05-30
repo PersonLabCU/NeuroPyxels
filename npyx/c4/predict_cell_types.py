@@ -1,5 +1,7 @@
 import argparse
 import contextlib
+import gc
+import json
 import multiprocessing
 import os
 import pickle
@@ -14,6 +16,7 @@ if __name__ == "__main__":
 
 import numpy as np
 import pandas as pd
+import psutil
 from joblib import Parallel, delayed
 
 with contextlib.suppress(ImportError):
@@ -28,6 +31,7 @@ from tqdm.auto import tqdm
 import npyx.corr as corr
 import npyx.datasets as datasets
 from npyx.gl import get_units, load_units_qualities
+from npyx.inout import resolve_phy_path
 from npyx.spk_t import trn, trn_filtered
 from npyx.spk_wvf import wvf_dsmatch
 
@@ -80,6 +84,64 @@ def get_n_cores(num_cores):
     return num_cores
 
 
+def get_memory_safe_n_cores(requested_cores: int, prefer_backend: str = "processes") -> int:
+    """Cap job count according to currently available RAM."""
+    try:
+        available = int(psutil.virtual_memory().available)
+    except Exception:
+        return max(1, requested_cores)
+
+    reserve_bytes = 2 * (1024**3)
+    # Each concurrent unit can transiently hold large waveform arrays.
+    bytes_per_worker = int(1.8 * (1024**3)) if prefer_backend == "processes" else int(1.2 * (1024**3))
+
+    if available <= reserve_bytes:
+        return 1
+
+    memory_limited_cores = max(1, (available - reserve_bytes) // bytes_per_worker)
+    return max(1, min(requested_cores, int(memory_limited_cores)))
+
+
+def get_memory_safe_matching_waves(t_waveforms: int, num_cores: int) -> int:
+    """Estimate a safe n_waves_used_for_matching per worker."""
+    try:
+        available = int(psutil.virtual_memory().available)
+    except Exception:
+        return 2000
+
+    reserve_bytes = 2 * (1024**3)
+    per_worker_budget = max((256 * (1024**2)), (available - reserve_bytes) // max(1, num_cores))
+
+    # float32 waveform size: n_waves * t_waveforms * 384 * 4 bytes
+    # include safety factor for temporary copies/masks during filtering.
+    safety_factor = 3.0
+    bytes_per_wave = max(1.0, float(t_waveforms * 384 * 4))
+    max_waves = int(per_worker_budget / (bytes_per_wave * safety_factor))
+
+    # Keep enough waves for robust matching while avoiding OOM.
+    return int(np.clip(max_waves, 1000, 5000))
+
+
+def _compute_unit_waveform(dp, u, again, n_waves_used_for_matching):
+    """Extract DSM waveform with memory-aware fallback."""
+    wave_levels = [int(n_waves_used_for_matching), 2000, 1000]
+    # Keep order while removing duplicates.
+    wave_levels = list(dict.fromkeys([w for w in wave_levels if w >= 1000]))
+
+    last_exc = None
+    for n_waves in wave_levels:
+        try:
+            return wvf_dsmatch(dp, u, t_waveforms=120, again=again, n_waves_used_for_matching=n_waves)
+        except MemoryError as exc:
+            last_exc = exc
+            gc.collect()
+
+    if last_exc is not None:
+        raise last_exc
+
+    return wvf_dsmatch(dp, u, t_waveforms=120, again=again)
+
+
 @contextlib.contextmanager
 def redirect_stdout_fd(file):
     stdout_fd = sys.stdout.fileno()
@@ -114,9 +176,10 @@ def directory_checks(data_path):
         print(
             "You are using an h5 file as input. Make sure it is formatted correctly according to the C4 collaboration pipeline."
         )
-        return
+        return data_path
 
     assert os.path.isdir(data_path), "Data folder is not a directory."
+    data_path = str(resolve_phy_path(data_path))
     assert os.path.exists(
         os.path.join(data_path, "params.py")
     ), "Make sure that the current working directory contains the output of a spike sorter compatible with phy (in particular the params.py file)."
@@ -135,8 +198,46 @@ def directory_checks(data_path):
     if os.path.exists(os.path.join(data_path, "cluster_cell_types.tsv")):
         os.remove(os.path.join(data_path, "cluster_cell_types.tsv"))
 
+    return data_path
 
-def prepare_dataset_from_binary(dp, units, again=False, fp_threshold=0.05, fn_threshold=0.05, peak_sign="negative"):
+
+def has_legacy_open_ephys_layout(dp: str) -> bool:
+    """Detect old OpenEphys stream naming (e.g., Neuropix-PXI-100.0/.1)."""
+    dp = Path(dp)
+    structure_path = None
+    for cand in [dp, *dp.parents]:
+        p = cand / "structure.oebin"
+        if p.exists():
+            structure_path = p
+            break
+    if structure_path is None:
+        return False
+
+    try:
+        with open(structure_path, "r", encoding="utf-8") as f:
+            meta_oe = json.load(f)
+        continuous = meta_oe.get("continuous", [])
+        folder_names = [str(stream.get("folder_name", "")).rstrip("/") for stream in continuous]
+    except Exception:
+        return False
+
+    if not folder_names:
+        return False
+
+    has_new_layout = any(("AP" in name) or ("LFP" in name) for name in folder_names)
+    has_legacy_layout = any(name.endswith(".0") or name.endswith(".1") for name in folder_names)
+    return has_legacy_layout and not has_new_layout
+
+
+def prepare_dataset_from_binary(
+    dp,
+    units,
+    again=False,
+    fp_threshold=0.05,
+    fn_threshold=0.05,
+    peak_sign="negative",
+    n_waves_used_for_matching=5000,
+):
     waveforms = []
     acgs_3d = []
     bad_units = []
@@ -177,9 +278,9 @@ def prepare_dataset_from_binary(dp, units, again=False, fp_threshold=0.05, fn_th
             continue
 
         try:
-            wvf, _, _, _ = wvf_dsmatch(dp, u, t_waveforms=120, again=again)
+            wvf, _, _, _ = _compute_unit_waveform(dp, u, again, n_waves_used_for_matching)
         except (IndexError, pd.errors.EmptyDataError, ValueError):
-            wvf, _, _, _ = wvf_dsmatch(dp, u, t_waveforms=120, again=True)
+            wvf, _, _, _ = _compute_unit_waveform(dp, u, True, n_waves_used_for_matching)
         waveforms.append(datasets.preprocess_template(wvf, peak_sign=peak_sign))
 
         _, acg = corr.crosscorr_vs_firing_rate(t, t, 2000, 1)
@@ -255,7 +356,16 @@ def prepare_dataset_from_h5(data_path):
     return dataset, dataset_class.h5_ids.tolist()
 
 
-def aux_prepare_dataset(dp, u, again=False, fp_threshold=0.05, fn_threshold=0.05, peak_sign="negative"):
+def aux_prepare_dataset(
+    dp,
+    u,
+    again=False,
+    fp_threshold=0.05,
+    fn_threshold=0.05,
+    peak_sign="negative",
+    n_waves_used_for_matching=5000,
+):
+    gc.collect()
     t = trn(dp, u)
     if len(t) < 100:
         # Bad units
@@ -289,14 +399,15 @@ def aux_prepare_dataset(dp, u, again=False, fp_threshold=0.05, fn_threshold=0.05
         return [True, [], []]
 
     try:
-        wvf, _, _, _ = wvf_dsmatch(dp, u, t_waveforms=120, again=again)
+        wvf, _, _, _ = _compute_unit_waveform(dp, u, again, n_waves_used_for_matching)
     except (IndexError, pd.errors.EmptyDataError, ValueError, pickle.UnpicklingError):
-        wvf, _, _, _ = wvf_dsmatch(dp, u, t_waveforms=120, again=True)
+        wvf, _, _, _ = _compute_unit_waveform(dp, u, True, n_waves_used_for_matching)
     waveforms = datasets.preprocess_template(wvf, peak_sign=peak_sign)
 
     _, acg = corr.crosscorr_vs_firing_rate(t, t, 2000, 1)
     acg, _ = corr.convert_acg_log(acg, 1, 2000)
     acgs_3d = acg.ravel() * 10
+    gc.collect()
 
     return [False, waveforms, acgs_3d]
 
@@ -310,11 +421,35 @@ def prepare_dataset_from_binary_parallel(
 
     num_cores = get_n_cores(len(units))
 
+    prefer_backend = "processes"
+    if has_legacy_open_ephys_layout(dp):
+        # Legacy OpenEphys sessions can stall with multiprocessing I/O.
+        # Use threads here to preserve correctness while avoiding worker hangs.
+        prefer_backend = "threads"
+        num_cores = min(num_cores, 8)
+
+    num_cores = get_memory_safe_n_cores(num_cores, prefer_backend=prefer_backend)
+    n_waves_used_for_matching = get_memory_safe_matching_waves(t_waveforms=120, num_cores=num_cores)
+    if n_waves_used_for_matching < 5000:
+        print(
+            f"Memory guard active: using {num_cores} workers and {n_waves_used_for_matching} waves for matching."
+        )
+
+    gc.collect()
     with redirect_stdout_fd(open(os.devnull, "w")):
-        dataset_results = Parallel(n_jobs=num_cores, prefer="processes")(
-            delayed(aux_prepare_dataset)(dp, u, again, fp_threshold, fn_threshold, peak_sign)
+        dataset_results = Parallel(n_jobs=num_cores, prefer=prefer_backend)(
+            delayed(aux_prepare_dataset)(
+                dp,
+                u,
+                again,
+                fp_threshold,
+                fn_threshold,
+                peak_sign,
+                n_waves_used_for_matching,
+            )
             for u in tqdm(units, desc="Preparing waveforms and ACGs for classification")
         )
+    gc.collect()
 
     for i in range(len(units)):
         if dataset_results[i][0] is True:
@@ -361,11 +496,27 @@ def prepare_dataset(args: ArgsNamespace) -> tuple:
 
         if args.parallel:
             prediction_dataset, bad_units = prepare_dataset_from_binary_parallel(
-                args.data_path, units, args.again, args.fp_threshold, args.fn_threshold, args.peak_sign
+                args.data_path,
+                units,
+                args.again,
+                args.fp_threshold,
+                args.fn_threshold,
+                args.peak_sign,
             )
         else:
+            n_waves_used_for_matching = get_memory_safe_matching_waves(t_waveforms=120, num_cores=1)
+            if n_waves_used_for_matching < 5000:
+                print(
+                    f"Memory guard active: using {n_waves_used_for_matching} waves for matching."
+                )
             prediction_dataset, bad_units = prepare_dataset_from_binary(
-                args.data_path, units, args.again, args.fp_threshold, args.fn_threshold, args.peak_sign
+                args.data_path,
+                units,
+                args.again,
+                args.fp_threshold,
+                args.fn_threshold,
+                args.peak_sign,
+                n_waves_used_for_matching=n_waves_used_for_matching,
             )
 
         good_units = [u for u in units if u not in bad_units]
@@ -521,7 +672,7 @@ def run_cell_types_classifier(
         args.peak_sign = None
 
     # Perform some checks on the data folder
-    directory_checks(args.data_path)
+    args.data_path = directory_checks(args.data_path)
 
     if args.data_path.endswith(".h5") == False:
         # This function checks the content of cluster_group.tsv file and regenerate this one if it is required.
@@ -583,12 +734,13 @@ def run_cell_types_classifier(
 
     # Check if this is the first time the ensemble is loaded on this machine
     precalibrated_ensemble_present = os.path.exists(serialised_ensemble)
+    inference_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     if not precalibrated_ensemble_present:
         with handle_outdated_model(RuntimeError, model_type):
             ensemble = load_ensemble(
                 models_archive,
-                device=torch.device("cpu"),
+                device=inference_device,
                 n_classes=6 if args.use_layer else 5,
                 use_layer=args.use_layer,
                 fast=False,
@@ -602,16 +754,52 @@ def run_cell_types_classifier(
         os.remove(models_archive)
         os.remove(hessians_archive)
     else:
-        ensemble = load_precalibrated_ensemble(serialised_ensemble, fast=False)
+        try:
+            ensemble = load_precalibrated_ensemble(serialised_ensemble, fast=False)
+        except Exception:
+            # Recover from a partially written cache (for example, interrupted calibration).
+            shutil.rmtree(serialised_ensemble, ignore_errors=True)
+            with handle_outdated_model(RuntimeError, model_type):
+                ensemble = load_ensemble(
+                    models_archive,
+                    device=inference_device,
+                    n_classes=6 if args.use_layer else 5,
+                    use_layer=args.use_layer,
+                    fast=False,
+                    laplace=True,
+                )
+            save_calibrated_ensemble(ensemble, serialised_ensemble)
 
-    raw_probabilities = ensemble_predict(
-        ensemble,
-        prediction_iterator,
-        device=torch.device("cpu"),
-        method="raw",
-        enforce_layer=False,
-        labelling=labelling,
-    )
+            # Remove the models archive to save space
+            if os.path.exists(models_archive):
+                os.remove(models_archive)
+            if os.path.exists(hessians_archive):
+                os.remove(hessians_archive)
+
+    try:
+        raw_probabilities = ensemble_predict(
+            ensemble,
+            prediction_iterator,
+            device=inference_device,
+            method="raw",
+            enforce_layer=False,
+            labelling=labelling,
+        )
+    except RuntimeError as exc:
+        if not torch.cuda.is_available():
+            raise
+        err = str(exc).lower()
+        if "cuda" not in err and "cudnn" not in err:
+            raise
+        print("CUDA inference failed, falling back to CPU for this run.")
+        raw_probabilities = ensemble_predict(
+            ensemble,
+            prediction_iterator,
+            device=torch.device("cpu"),
+            method="raw",
+            enforce_layer=False,
+            labelling=labelling,
+        )
 
     predictions, mean_top_pred_confidence, _, n_votes, confidence_ratio = format_predictions(raw_probabilities)
     predictions_str = [correspondence[int(prediction)] for prediction in predictions]

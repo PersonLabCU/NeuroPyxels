@@ -1,4 +1,5 @@
 import traceback
+import inspect
 
 import numpy as np
 
@@ -78,6 +79,35 @@ def test_function(fun, raise_error=False, ret=False, **kwargs):
         print(f"{prefix}Successfully ran '{fun.__name__}' from {fun.__module__}.{suffix}")
         if ret: return r
     except Exception as err:
+        # Network-backed caches can occasionally report missing artifacts.
+        # Retry once without local caching when the function supports it.
+        if isinstance(err, KeyError) and 'Non-existing item' in str(err):
+            sig = inspect.signature(fun)
+            retry_kwargs = dict(kwargs)
+            retried = False
+            accepts_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+            if 'cache_results' in sig.parameters or accepts_var_kwargs:
+                retry_kwargs['cache_results'] = False
+                retried = True
+            if 'save' in sig.parameters and 'save' not in retry_kwargs:
+                retry_kwargs['save'] = False
+                retried = True
+            if 'again' in sig.parameters:
+                retry_kwargs['again'] = True
+                retried = True
+            if retried:
+                try:
+                    r = fun(**retry_kwargs)
+                    print((f"{prefix}Recovered from cache miss and successfully ran "
+                           f"'{fun.__name__}' from {fun.__module__}.{suffix}"))
+                    if ret: return r
+                    return
+                except Exception:
+                    pass
+
         print(f"{red_prefix}Failed to run '{fun.__name__}' from {fun.__module__} with the following error:{suffix}")
         e = traceback.format_exc()
         print(e)

@@ -69,28 +69,57 @@ def whitening(x, nRange=None, use_ks_matrix=True,
         w = whitening_matrix(x, nRange, use_ks_matrix, dp)
 
     
-    # Whiten and re-scale to match original microvolts
-    x = cp.array(x)
-    scales=(np.max(x, 1)-np.min(x, 1))
-    x = np.dot(x.T,w).T
-    W_scales=(np.max(x, 1)-np.min(x, 1))
-    x=x*np.repeat((scales/W_scales).reshape(x.shape[0], 1), x.shape[1], axis=1)
-
-    # re-plug in unprocessed channels
-    if use_ks_matrix:
-        if channels_mask is not None:
-            x_full = cp.zeros((unprocessed_channels_masked.shape[0], x.shape[1]))
-            x_full[~unprocessed_channels_masked] = x
-            x_full[unprocessed_channels_masked] = unprocessed_traces
-        else:
-            x_full = cp.zeros((unprocessed_channels.shape[0], x.shape[1]))
-            x_full[~unprocessed_channels] = x
-            x_full[unprocessed_channels] = unprocessed_traces
-        
-        x = x_full
-    
+    # Whiten and re-scale to match original microvolts.
+    # Prefer GPU when available, but transparently fall back to CPU if CUDA libs are missing.
+    used_gpu = False
     if 'cp' in globals():
-        x = cp.asnumpy(x)
+        try:
+            x_gpu = cp.asarray(x)
+            w_gpu = cp.asarray(w)
+            scales = cp.max(x_gpu, axis=1) - cp.min(x_gpu, axis=1)
+            x_gpu = cp.dot(w_gpu, x_gpu)
+            w_scales = cp.max(x_gpu, axis=1) - cp.min(x_gpu, axis=1)
+            x_gpu = x_gpu * cp.repeat((scales / w_scales).reshape(x_gpu.shape[0], 1), x_gpu.shape[1], axis=1)
+
+            # re-plug in unprocessed channels
+            if use_ks_matrix:
+                if channels_mask is not None:
+                    x_full = cp.zeros((unprocessed_channels_masked.shape[0], x_gpu.shape[1]))
+                    x_full[~unprocessed_channels_masked] = x_gpu
+                    x_full[unprocessed_channels_masked] = cp.asarray(unprocessed_traces)
+                else:
+                    x_full = cp.zeros((unprocessed_channels.shape[0], x_gpu.shape[1]))
+                    x_full[~unprocessed_channels] = x_gpu
+                    x_full[unprocessed_channels] = cp.asarray(unprocessed_traces)
+                x_gpu = x_full
+
+            x = cp.asnumpy(x_gpu)
+            used_gpu = True
+        except Exception:
+            used_gpu = False
+
+    if not used_gpu:
+        x = np.asarray(x)
+        if 'cp' in globals() and isinstance(w, cp.ndarray):
+            w = cp.asnumpy(w)
+        else:
+            w = np.asarray(w)
+        scales = np.max(x, axis=1) - np.min(x, axis=1)
+        x = np.dot(w, x)
+        w_scales = np.max(x, axis=1) - np.min(x, axis=1)
+        x = x * np.repeat((scales / w_scales).reshape(x.shape[0], 1), x.shape[1], axis=1)
+
+        # re-plug in unprocessed channels
+        if use_ks_matrix:
+            if channels_mask is not None:
+                x_full = np.zeros((unprocessed_channels_masked.shape[0], x.shape[1]))
+                x_full[~unprocessed_channels_masked] = x
+                x_full[unprocessed_channels_masked] = unprocessed_traces
+            else:
+                x_full = np.zeros((unprocessed_channels.shape[0], x.shape[1]))
+                x_full[~unprocessed_channels] = x
+                x_full[unprocessed_channels] = unprocessed_traces
+            x = x_full
 
     return x
 
@@ -116,11 +145,16 @@ def whitening_matrix(x, nRange=None, use_ks_matrix=True, dp=None):
                   " so nRange is not taken into account (kilosort uses nRange=32 by default)"))
         assert dp is not None, "You must provide a datapath when instructing to use kilosort's whitening matrix."
         w, unprocessed_channels = load_ks_whitening_matrix(dp)
-        return cp.array(w), unprocessed_channels
+        return w, unprocessed_channels
 
     # get covariance matrix across rows (each row is an observation)
-    x_cov = cp.cov(x, rowvar=1) 
-    return cov_to_whitening_matrix(x_cov, nRange)
+    if 'cp' in globals():
+        try:
+            x_cov = cp.cov(x, rowvar=1)
+            return cov_to_whitening_matrix(x_cov, nRange)
+        except Exception:
+            pass
+    return whitening_matrix_cpu(np.asarray(x), nRange=nRange)
 
 def load_ks_whitening_matrix(dp, return_full=False):
     """
