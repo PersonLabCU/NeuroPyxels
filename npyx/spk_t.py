@@ -117,14 +117,15 @@ def load_amplitudes(dp, unit, verbose=False,
                     cache_results=True, cache_path=None):
     f'''Load unit amplitudes
     i.e. kilosort template scaling factor for each spike.
-    
+
     for parameters see doc of ids:
     {ids.__doc__}'''
     dp = Path(dp)
+    dp_source = npyx.merger.get_source_dp_u(dp, unit)[0]
     unit_ids = ids(dp, unit, True, verbose, periods, again, enforced_rp,
                    cache_results=cache_results, cache_path=cache_path)
     # amplitudes.npy can be (N, 1) depending on sorter/export; flatten for downstream scalar math.
-    return np.ravel(np.load(dp/'amplitudes.npy')[unit_ids])
+    return np.ravel(np.load(dp_source/'amplitudes.npy')[unit_ids])
 
 @npyx_cacher
 def trn(dp, unit, sav=True, verbose=False,

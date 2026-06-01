@@ -23,6 +23,7 @@ from npyx.inout import (
     get_npix_sync,
     preprocess_binary_file,
     read_metadata,
+    resolve_phy_path,
 )
 from npyx.spk_t import (
     duplicates_mask,
@@ -479,7 +480,7 @@ def add_unit_h5(
         # amplitudes
         key = "amplitudes"
         if assert_recompute(key, neuron_group, overwrite_h5, selective_overwrite):
-            amps = np.load(dp / "amplitudes.npy").squeeze()[
+            amps = np.load(resolve_phy_path(dp) / "amplitudes.npy").squeeze()[
                 ids(dp, unit_id, enforced_rp=0, cache_results=cache_data)
             ]
             write_to_group(neuron_group, key, amps)

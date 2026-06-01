@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import gc
+import io
 import json
 import multiprocessing
 import os
@@ -144,15 +145,23 @@ def _compute_unit_waveform(dp, u, again, n_waves_used_for_matching):
 
 @contextlib.contextmanager
 def redirect_stdout_fd(file):
-    stdout_fd = sys.stdout.fileno()
-    stdout_fd_dup = os.dup(stdout_fd)
-    os.dup2(file.fileno(), stdout_fd)
-    file.close()
     try:
+        stdout_fd = sys.stdout.fileno()
+        target_fd = file.fileno()
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        # ipykernel streams (Jupyter) may not expose a real file descriptor.
+        with contextlib.redirect_stdout(file):
+            yield
+        return
+
+    stdout_fd_dup = os.dup(stdout_fd)
+    try:
+        os.dup2(target_fd, stdout_fd)
         yield
     finally:
         os.dup2(stdout_fd_dup, stdout_fd)
         os.close(stdout_fd_dup)
+        file.close()
 
 
 @contextlib.contextmanager

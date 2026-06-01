@@ -100,9 +100,14 @@ def resolve_phy_path(dp: Path) -> Path:
     """Resolve a user datapath to a Phy/Kilosort folder containing params.py.
 
     Supports users passing either:
+    - sorter output folder (.../kilosort4)
     - stream folder (.../continuous/<stream>)
     - continuous folder (.../continuous)
     - recording root (.../recording1)
+
+    KS4 places its output in a named subfolder inside the stream directory
+    (e.g. .../OneBox-108.ProbeA-AP/kilosort4/), so this function searches one
+    level deeper than previous sorters required.
     """
     dp = Path(dp)
     if (dp / "params.py").exists():
@@ -110,10 +115,20 @@ def resolve_phy_path(dp: Path) -> Path:
 
     candidates = []
 
-    if (dp / "continuous").exists() and (dp / "continuous").is_dir():
-        candidates.extend([p for p in (dp / "continuous").iterdir() if p.is_dir()])
-    if dp.name == "continuous" and dp.is_dir():
+    def _add_with_subdirs(dirs):
+        for p in dirs:
+            if p.is_dir():
+                candidates.append(p)
+                candidates.extend([sub for sub in p.iterdir() if sub.is_dir()])
+
+    # KS4: sorter output is a subfolder of the stream dir (e.g. kilosort4/)
+    if dp.is_dir():
         candidates.extend([p for p in dp.iterdir() if p.is_dir()])
+
+    if (dp / "continuous").exists() and (dp / "continuous").is_dir():
+        _add_with_subdirs((dp / "continuous").iterdir())
+    if dp.name == "continuous" and dp.is_dir():
+        _add_with_subdirs(dp.iterdir())
 
     # Also support nearby parent variants.
     parent_candidates = [dp]
@@ -121,7 +136,7 @@ def resolve_phy_path(dp: Path) -> Path:
     for cand in parent_candidates:
         cont = cand / "continuous"
         if cont.exists() and cont.is_dir():
-            candidates.extend([p for p in cont.iterdir() if p.is_dir()])
+            _add_with_subdirs(cont.iterdir())
 
     seen = set()
     stream_dirs = []
@@ -284,13 +299,28 @@ def metadata(dp):
             meta_oe = json.load(f)
 
         # find probe version
-        for i,processor in enumerate(meta_oe['continuous']):
-            if 'Neuropix-PXI' in processor["source_processor_name"]:
+        probe_index = None
+        for i, processor in enumerate(meta_oe['continuous']):
+            proc_name = processor["source_processor_name"]
+            if any(known in proc_name for known in probe_versions['oe'].keys()):
                 probe_index = i
                 break
+            elif 'OneBox' in proc_name:
+                probe_index = i
+                break
+        assert probe_index is not None, \
+            (f"Could not identify a Neuropixels processor in {metafile}. "
+             f"Known OpenEphys processor names: {[k for k in probe_versions['oe'].keys() if not k.startswith('?')]}. "
+             f"Processors found: {[p['source_processor_name'] for p in meta_oe['continuous']]}. "
+             f"Post an issue at www.github.com/m-beau/NeuroPyxels")
         oe_probe_version = meta_oe["continuous"][probe_index]["source_processor_name"]
+        # OneBox recordings: probe type not encoded in source_processor_name; assume NP 1.0
+        if 'OneBox' in oe_probe_version and oe_probe_version not in probe_versions['oe']:
+            print("WARNING OneBox recording detected; assuming NP 1.0 probe type. "
+                  "If using a NP 2.0 probe via OneBox, post an issue at www.github.com/m-beau/NeuroPyxels")
+            oe_probe_version = "Neuropix-PXI"
         assert oe_probe_version in probe_versions['oe'].keys(),\
-            f'WARNING only probe version {oe_probe_version} not handled with openEphys - post an issue at www.github.com/m-beau/NeuroPyxels'
+            f'WARNING probe version {oe_probe_version} not handled with openEphys - post an issue at www.github.com/m-beau/NeuroPyxels'
         meta['probe_version']=probe_versions['oe'][oe_probe_version]
         meta['probe_version_int'] = probe_versions['int'][meta['probe_version']]
 
@@ -501,7 +531,7 @@ def chan_map(dp=None, y_orig='surface', probe_version=None):
             raise ValueError("dp argument is not provided - when local channel map is \
                              specified (rather than a predefined version), \
                              the datapath needs to be provided to load the channel map.")
-        dp = Path(dp)
+        dp = resolve_phy_path(Path(dp))
         c_ind = np.load(dp / 'channel_map.npy')
         cp    = np.load(dp / 'channel_positions.npy')
         # c_ind may be stored as (1, N) or (N,) — reshape to (N, 1) for concatenation
@@ -686,18 +716,20 @@ def get_npix_sync(dp, output_binary = False, filt_key='highpass', unit='seconds'
             "Pass the recording root path or a valid subpath under it."
         )
 
-        events_dirs = [p for p in events_path.iterdir() if 'PXI' in str(p)]
-        high_pass_candidates = [p for p in events_dirs if ("AP" in str(p))|("100.0" in str(p))]
-        low_pass_candidates = [p for p in events_dirs if ("LF" in str(p))|("100.1" in str(p))]
+        # Match both PXI-based ('Neuropix-PXI') and OneBox-based probe event streams
+        events_dirs = [p for p in events_path.iterdir()
+                       if 'PXI' in str(p) or 'OneBox' in str(p) or 'Neuropix' in str(p)]
+        high_pass_candidates = [p for p in events_dirs if ("AP" in str(p)) or ("100.0" in str(p))]
+        low_pass_candidates  = [p for p in events_dirs if ("LF" in str(p)) or ("100.1" in str(p))]
 
-        assert any(high_pass_candidates), f"No OpenEphys AP/PXI events stream found in {events_path}."
+        assert any(high_pass_candidates), f"No OpenEphys AP/PXI/OneBox events stream found in {events_path}."
         high_pass_dir = high_pass_candidates[0]
         low_pass_dir = low_pass_candidates[0] if any(low_pass_candidates) else None
 
 
         if filt_key == 'lowpass':
             assert low_pass_dir is not None, (
-                f"No OpenEphys LF/PXI lowpass events stream found in {events_path}."
+                f"No OpenEphys LF/PXI/OneBox lowpass events stream found in {events_path}."
             )
             events_dir = low_pass_dir
         else:
@@ -1093,14 +1125,13 @@ def detect_hardware_filter(dp):
     hpfiltered_int = int(imro_table[1][-1]) # 0 or 1
     return bool(hpfiltered_int)
 
-def preprocess_binary_file(dp=None, filt_key='ap', fname=None, target_dp=None, move_orig_data=True,
+def preprocess_binary_file(dp=None, filt_key='ap', fname=None, target_dp=None, move_orig_data=False,
                        ADC_realign = False, median_subtract=True, f_low=None, f_high=300, order=3,
                        filter_forward=True, filter_backward=False,
                        spatial_filt=False, whiten = False, whiten_range=32,
                        again_Wrot=False, verbose=False, again_if_preprocessed_filename=False,
                        delete_original_data=False, data_deletion_double_check=False):
-    """Creates a preprocessed copy of binary file at dp/fname_filtered.bin,
-    and moves the original binary file to dp/original_data.fname.bin.
+    """Creates a preprocessed copy of binary file at dp/fname_filtered.bin.
 
     One must precise either dp (path to directory or ) or fname (absolute path to binary file).
 
@@ -1122,7 +1153,7 @@ def preprocess_binary_file(dp=None, filt_key='ap', fname=None, target_dp=None, m
     - filt_key: str, 'ap' or 'lf' (if filtering ap.bin or lf.bin file)
     - fname: optional str, absolute path of binary file to filter (if provided, *.bin will not be guessed)
     - target_dp: str or Path, directory to save preprocessed binary file (by default, dp)
-    - move_orig_data: bool, if true a directory is created at dp/original_data, and the original binary file is moved there.
+    - move_orig_data: bool, deprecated no-op kept for backward compatibility.
     - ADC_realign: bool, whether to realign data based on Neuropixels ADC shifts (slow because requires FFT)
     - CAR: bool, whether to perform common average subtraction
     - f_low: optional float, lowpass filter frequency
@@ -1293,30 +1324,14 @@ def preprocess_binary_file(dp=None, filt_key='ap', fname=None, target_dp=None, m
     # so... close the memory mapped file o_o
     memmap_f._mmap.close()
 
-    # Finally, if everything ran smoothly,
-    # move original binary to new directory
+    # Deprecated behavior: keep parameter for backward compatibility.
     if move_orig_data:
-        orig_dp = dp/'original_data'
-        orig_dp.mkdir(exist_ok=True)
-        if not (orig_dp/fname.name).exists(): fname.replace(orig_dp/fname.name)
-        meta_f = get_meta_file_path(dp, filt_key, False)
-        if not (orig_dp/meta_f).exists():
-            if (dp/meta_f).exists():
-                shutil.copy(dp/meta_f, orig_dp/meta_f)
-            if (dp/'channel_map.npy').exists():
-                shutil.copy(dp/'channel_map.npy', orig_dp/'channel_map.npy')
-            if (dp/'channel_positions.npy').exists():
-                shutil.copy(dp/'channel_positions.npy', orig_dp/'channel_positions.npy')
-            if (dp/'whitening_mat.npy').exists():
-                shutil.copy(dp/'whitening_mat.npy', orig_dp/'whitening_mat.npy')
+        print("WARNING 'move_orig_data' is deprecated and ignored. Original data location is unchanged.")
 
     if delete_original_data:
         assert data_deletion_double_check,\
         "WARNING you are attempting to delete the original binary file - if you wish to proceed, you must also set 'data_deletion_double_check' to True."
-        if move_orig_data:
-            shutil.rmtree(dp/'original_data')
-        else:
-            os.remove(fname)
+        os.remove(fname)
     else:
         if data_deletion_double_check:
             print("WARNING you attempted to delete the original binary file - 'delete_original_data' was not set to True, so the deletion was cancelled.")

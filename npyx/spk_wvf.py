@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from npyx.gl import get_npyx_memory, get_units
-from npyx.inout import chan_map, get_binary_file_path, read_metadata
+from npyx.inout import chan_map, get_binary_file_path, read_metadata, resolve_phy_path
 from npyx.preprocess import apply_filter, bandpass_filter, med_substract, whitening
 from npyx.utils import npyx_cacher, npa, split, xcorr_1d_loop
 
@@ -81,10 +81,14 @@ def wvf(dp, u=None, n_waveforms=100, t_waveforms=82, selection='regular', period
         if u is not None and verbose: print('WARNING you provided both u and spike_ids! u is ignored.')
         if n_waveforms !=100 and verbose: print('WARNING you provided both n_waveforms and spike_ids! n_waveforms is ignored.')
         if not isinstance(periods,str) and verbose: print('WARNING you provided both periods and spike_ids! periods is ignored.')
-        u=np.unique(np.load(Path(dp)/'spike_clusters.npy')[spike_ids])
+        dp_sort = resolve_phy_path(dp)
+        u=np.unique(np.load(Path(dp_sort)/'spike_clusters.npy')[spike_ids])
         assert len(u)==1, 'WARNING the spike ids that you provided seem to belong to different units!! Double check!'
         u=u[0]
-    dp, u = get_source_dp_u(dp, u)
+    # Do NOT reassign dp here: get_waveforms needs the original stream-folder path
+    # to locate the binary file. The sort-folder (kilosort4/) is resolved internally
+    # by get_waveforms via get_source_dp_u.
+    _, u = get_source_dp_u(dp, u)
 
     # DEPRECATED - now caching with cachecache
     # dpnm = get_npyx_memory(dp)
@@ -158,9 +162,9 @@ def get_waveforms(dp, u, n_waveforms=100, t_waveforms=82, selection='regular', p
             "and be aware that something went wrong in your data management...\033[0m"))
 
     # Select subset of spikes
-    spike_samples = np.load(Path(dp, 'spike_times.npy'), mmap_mode='r').squeeze()
+    spike_samples = np.load(Path(dp_source, 'spike_times.npy'), mmap_mode='r').squeeze()
     if spike_ids is None:
-        spike_ids_subset = get_ids_subset(dp, u,
+        spike_ids_subset = get_ids_subset(dp_source, u,
                                           n_waveforms, wvf_batch_size, selection, periods,
                                           ignore_nwvf, verbose,
                                           again, cache_results=cache_results, cache_path=cache_path)
@@ -218,7 +222,7 @@ def get_waveforms(dp, u, n_waveforms=100, t_waveforms=82, selection='regular', p
 
     # Filter channels ignored by kilosort if necesssary
     if not ignore_ks_chanfilt:
-        channel_ids_ks = np.load(Path(dp, 'channel_map.npy'), mmap_mode='r').squeeze()
+        channel_ids_ks = np.load(Path(dp_source, 'channel_map.npy'), mmap_mode='r').squeeze()
         channel_ids_ks = channel_ids_ks[channel_ids_ks!=384]
         waveforms      = waveforms[:,:,channel_ids_ks] # only AFTER processing, filter out channels
 
@@ -352,11 +356,12 @@ def wvf_dsmatch(dp, u, n_waveforms=100, t_waveforms=82, periods='all',
     #     return np.load(Path(dpnm,fn)),drift_shift_matched_mean,np.load(Path(dpnm,fn_spike_id)), np.load(Path(dpnm,fn_peakchan))
 
     ## Extract spike ids so we can extract consecutive waveforms
+    dp_source = get_source_dp_u(dp, u)[0]
     spike_ids_all = ids(dp, u, periods=periods, again=again, cache_results=cache_results, cache_path=cache_path)
     # make sure to only select waveforms from 1 cluster if there was a merge
     # (arbitrary decision: the cluster with the largest amount of spikes)
     if subselect_max_template:
-        spike_templates=np.load(Path(dp,'spike_templates.npy')).squeeze()[spike_ids_all]
+        spike_templates=np.load(Path(dp_source,'spike_templates.npy')).squeeze()[spike_ids_all]
         template_ids, template_ns = np.unique(spike_templates, return_counts=True)
         template_to_use = template_ids[np.argmax(template_ns)]
         spike_ids_all = spike_ids_all[spike_templates==template_to_use]
